@@ -1,0 +1,1137 @@
+# 直播导播口令编排 API
+
+基于 **Python + FastAPI** 的导播口令编排服务：接收一组带锚点依赖的直播导播口令，
+解析每条口令在时间轴上的起止毫秒，并列出同一通道内半开区间重叠的冲突口令对；
+直播进行中还可对节目单做延误分摊，在不移动固定开场时刻的前提下把延误按各段
+可压缩余量比例分配给未播段；直播结束后可将计划口令与实播记录按通道保序对账，
+以最小的起止偏差与漏播、额外播出罚分还原实际播出情况；还可在不改变任何起止
+时刻的前提下，把口令全局改派到按 id 指定的备用通道，求改派口令最少、并列时
+通道名序列字典序最小的无冲突方案；亦可对 base / left / right 三份口令版本按
+id 和字段做无状态三方合并，无分歧时直接复用编排器校验合并结果；还可在给定起点
+窗口内为指定通道规划一条临时插播，求需要撤销的现有口令最少、并列时起点最早的
+插播方案。
+
+- 在线接口文档（Swagger UI）：<http://localhost:8000/docs>
+- 健康检查：`GET /health`
+- 编排接口：`POST /compile`
+- 改动预览接口：`POST /preview`
+- 节目单延误分摊接口：`POST /schedule/rebalance`
+- 实播对账接口：`POST /runs/reconcile`
+- 通道改派接口：`POST /routing/assign`
+- 口令三方合并接口：`POST /versions/merge`
+- 临时插播规划接口：`POST /interruptions/plan`
+
+## 一条命令启动
+
+需要已安装 Docker（含 Compose 插件）。在本目录执行：
+
+```bash
+docker compose up --build -d
+```
+
+启动后访问 <http://localhost:8000/docs> 即可在线调试。也可以用 curl 验证：
+
+```bash
+curl -s http://localhost:8000/health
+# {"status":"ok"}
+```
+
+停止服务：
+
+```bash
+docker compose down
+```
+
+> 镜像在构建阶段执行 `pip install -r requirements.txt`，**启动容器时依赖已安装完毕**，
+> 无需进入容器手动安装。
+
+## 必要配置
+
+| 配置项 | 说明 | 默认值 |
+| --- | --- | --- |
+| 容器监听端口 | 固定 `8000`（由 `uvicorn --port 8000` 指定） | `8000` |
+| 宿主机映射端口 | Compose 读取环境变量 `PUBLISH_PORT`，映射为 `${PUBLISH_PORT}:8000` | `8000` |
+| 依赖安装 | `Dockerfile` 构建时执行 `pip install -r requirements.txt` | 自动 |
+
+如需改用宿主机 9000 端口：
+
+```bash
+PUBLISH_PORT=9000 docker compose up --build -d
+```
+
+服务无数据库、无外部依赖，不需要额外配置环境变量。
+
+## 接口约定：`POST /compile`
+
+请求体为口令数组，每一项字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `id` | string | 是 | 口令唯一 id；不能为空，不能使用保留锚点名 `START` |
+| `channel` | string | 是 | 通道标识；只有同通道口令之间才检测冲突 |
+| `anchor` | string | 否 | 锚点，缺省 `START`；可填 `START`（时间原点 0 ms）或另一条口令的 id |
+| `offset_ms` | integer | 否 | 相对 **锚点结束时刻** 的偏移（毫秒），缺省 `0`，允许为负 |
+| `duration_ms` | integer | 是 | 持续时长（毫秒），必须为正数 |
+
+时间与冲突规则：
+
+- 虚拟锚点 `START` 的起点和结束时刻均为 `0`。
+- 口令 `x` 的起点 = 锚点口令的结束时刻 + `offset_ms`，结束时刻 = 起点 + `duration_ms`。
+- 允许负偏移，但解析出的起点不得小于 `0`，否则返回 `NEGATIVE_START`。
+- `timeline` 按 `(start_ms, id)` 升序排列。
+- 同一通道内两个半开区间 `[start_ms, end_ms)` 发生重叠即为冲突；
+  **首尾相接（前一个 end 等于后一个 start）不算冲突**；不同通道互不影响。
+- 冲突对对内按 id 排序（`a < b`），所有冲突对之间按 `(a, b, channel)` 排序。
+
+### 请求示例
+
+```bash
+curl -s http://localhost:8000/compile \
+  -H 'Content-Type: application/json' \
+  -d '[
+    {"id": "a", "channel": "main", "anchor": "START", "offset_ms": 0,    "duration_ms": 1000},
+    {"id": "b", "channel": "main", "anchor": "a",     "offset_ms": 0,    "duration_ms": 500},
+    {"id": "c", "channel": "main", "anchor": "a",     "offset_ms": -200, "duration_ms": 500},
+    {"id": "d", "channel": "sub",  "anchor": "START", "offset_ms": 0,    "duration_ms": 1000}
+  ]'
+```
+
+对应时间：
+
+- `a`：`[0, 1000)`
+- `b`：相对 `a` 结束时刻（1000）+ 0 → `[1000, 1500)`，与 `a` 首尾相接，不冲突
+- `c`：相对 `a` 结束时刻 -200 → `[800, 1300)`，与 `a`、`b` 均在 `main` 通道重叠
+- `d`：`[0, 1000)`，但属于 `sub` 通道，不参与冲突
+
+响应示例（`200`）：
+
+```json
+{
+  "timeline": [
+    {
+      "id": "a",
+      "channel": "main",
+      "anchor": "START",
+      "offset_ms": 0,
+      "duration_ms": 1000,
+      "start_ms": 0,
+      "end_ms": 1000
+    },
+    {
+      "id": "d",
+      "channel": "sub",
+      "anchor": "START",
+      "offset_ms": 0,
+      "duration_ms": 1000,
+      "start_ms": 0,
+      "end_ms": 1000
+    },
+    {
+      "id": "c",
+      "channel": "main",
+      "anchor": "a",
+      "offset_ms": -200,
+      "duration_ms": 500,
+      "start_ms": 800,
+      "end_ms": 1300
+    },
+    {
+      "id": "b",
+      "channel": "main",
+      "anchor": "a",
+      "offset_ms": 0,
+      "duration_ms": 500,
+      "start_ms": 1000,
+      "end_ms": 1500
+    }
+  ],
+  "conflicts": [
+    {
+      "channel": "main",
+      "a": "a",
+      "b": "c",
+      "a_interval": [0, 1000],
+      "b_interval": [800, 1300]
+    },
+    {
+      "channel": "main",
+      "a": "b",
+      "b": "c",
+      "a_interval": [1000, 1500],
+      "b_interval": [800, 1300]
+    }
+  ]
+}
+```
+
+## 接口约定：`POST /preview`
+
+在不落地任何数据的前提下，预览「修改一条现有口令的 `offset_ms` / `duration_ms`」
+对整条编排的影响。服务端会分别编译**原编排**和**改动后编排**，再对比差异。
+
+请求体为一个对象：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `commands` | array | 是 | 口令数组，每一项的字段与 `POST /compile` 的请求体完全一致 |
+| `change` | object | 是 | 一项改动，见下表 |
+
+`change` 字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `id` | string | 是 | 要改动的现有口令 id（必须存在于 `commands` 中） |
+| `offset_ms` | integer | 二选一 | 新的偏移；不填则保留原值 |
+| `duration_ms` | integer | 二选一 | 新的持续时长（仍须为正数）；不填则保留原值 |
+
+`offset_ms` 与 `duration_ms` **至少提供一个**；未提供的字段以及其他字段
+（`channel`、`anchor` 等）一律保留原值，原请求数据不会被修改。原编排与改动后编排
+均沿用与 `/compile` 相同的字段校验与 `422` 错误格式。
+
+响应字段：
+
+- `changed_ids`：时间起止（`start_ms` / `end_ms`）发生变化的口令 id，
+  **包含锚点依赖的传导**（被改动口令的下游口令会一起移动），按 id 升序。
+- `added_conflicts`：改动后**新增**的同通道冲突对，区间为改动后版本。
+- `removed_conflicts`：改动后**消失**的同通道冲突对，区间为原版本。
+
+冲突对以 `(channel, a, b)` 判定身份（同一条冲突对若只是区间变化，不算新增也不算消失）；
+每个冲突对仍携带 `a_interval` / `b_interval`，两个列表均按 `(a, b, channel)` 排序。
+
+### 请求示例
+
+```bash
+curl -s http://localhost:8000/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commands": [
+      {"id": "a", "channel": "main", "anchor": "START", "offset_ms": 0,    "duration_ms": 1000},
+      {"id": "b", "channel": "main", "anchor": "a",     "offset_ms": 0,    "duration_ms": 500},
+      {"id": "c", "channel": "main", "anchor": "a",     "offset_ms": -200, "duration_ms": 500},
+      {"id": "d", "channel": "sub",  "anchor": "START", "offset_ms": 0,    "duration_ms": 1000}
+    ],
+    "change": {"id": "a", "offset_ms": 100}
+  }'
+```
+
+改动把 `a` 的起点推迟到 100 ms：
+
+- `a`：`[0, 1000)` → `[100, 1100)`。
+- `b` 锚定 `a` 的结束时刻：`[1000, 1500)` → `[1100, 1600)`（依赖传导）。
+- `c` 锚定 `a` 的结束时刻：`[800, 1300)` → `[900, 1400)`（依赖传导）。
+- `d` 不依赖 `a`，时间不变。
+
+原有的两个冲突对 `(main, a, c)`、`(main, b, c)` 改动后仍然重叠，身份不变。
+响应示例（`200`）：
+
+```json
+{
+  "changed_ids": ["a", "b", "c"],
+  "added_conflicts": [],
+  "removed_conflicts": []
+}
+```
+
+下面这个改动把 `c` 的持续时长缩短为 100 ms：
+
+```bash
+curl -s http://localhost:8000/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commands": [
+      {"id": "a", "channel": "main", "anchor": "START", "offset_ms": 0,    "duration_ms": 1000},
+      {"id": "b", "channel": "main", "anchor": "a",     "offset_ms": 0,    "duration_ms": 500},
+      {"id": "c", "channel": "main", "anchor": "a",     "offset_ms": -200, "duration_ms": 500},
+      {"id": "d", "channel": "sub",  "anchor": "START", "offset_ms": 0,    "duration_ms": 1000}
+    ],
+    "change": {"id": "c", "duration_ms": 100}
+  }'
+```
+
+`c` 由 `[800, 1300)` 缩短为 `[800, 900)`：与 `a`（`[0, 1000)`）仍重叠，
+但与 `b`（`[1000, 1500)`）不再重叠，冲突对 `(b, c)` 消失，区间携带原版本：
+
+```json
+{
+  "changed_ids": ["c"],
+  "added_conflicts": [],
+  "removed_conflicts": [
+    {
+      "channel": "main",
+      "a": "b",
+      "b": "c",
+      "a_interval": [1000, 1500],
+      "b_interval": [800, 1300]
+    }
+  ]
+}
+```
+
+把 `c` 反过来延长（例如 `duration_ms: 800` → `[800, 1600)`）则不会产生新冲突对；
+而把原本首尾相接的口令延长到越过对方起点时，新冲突会出现在 `added_conflicts` 中，
+区间携带改动后的版本。
+
+## 接口约定：`POST /schedule/rebalance`
+
+直播进行中，已结束段的实际结束时刻往往偏离计划，节目单整体随之延误或提前。
+本接口在**不移动任何固定开场时刻**的前提下，把延误按各段**可压缩余量**
+（计划时长 − 最短时长）的比例分摊给固定点之前的未播段，返回调整后的各段时长。
+
+请求体为一个对象：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `segments` | array | 是 | 按播出顺序排列的节目段，允许为空数组 |
+
+`segments` 每一项字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `id` | string | 是 | 节目段唯一 id；不能为空 |
+| `planned_duration_sec` | integer | 是 | 计划时长（秒），正数且不短于 `min_duration_sec` |
+| `min_duration_sec` | integer | 是 | 最短时长（秒），正数；延误分摊时的压缩下限 |
+| `fixed_start_at_sec` | integer | 否 | 固定开场时刻（秒，相对节目单原点 0）；不可移动，缺省表示非固定点 |
+| `actual_end_at_sec` | integer | 否 | 已结束段的实际结束时刻（秒）；缺省表示该段未播 |
+
+分摊规则：
+
+- **固定点切窗**：带 `fixed_start_at_sec` 的段是固定点，它把节目单切成若干窗口，
+  每个窗口内的段必须在窗口末尾的固定点时刻之前播完；最后一个固定点之后的段
+  没有窗口约束，保持计划时长。
+- **可用时间**：窗口内已结束段的最后一个 `actual_end_at_sec` 决定未播段的可用时间
+  （可用时间 = 固定点时刻 − 该实际结束时刻；窗口内无已结束段时从窗口起点算起）。
+- **延误分摊**：窗口内未播段计划总时长超出可用时间的部分即延误，按各段可压缩余量
+  比例分摊压缩；整数秒余数按**小数部分从大到小**分配，**同分按节目顺序**（靠前者先得）；
+  任何段不会被压到 `min_duration_sec` 以下（余量为 0 的段不参与分摊）。
+- **提前不拉伸**：可用时间有富余时不拉长任何段，富余秒数作为该固定点的
+  `remaining_sec` 返回（可追回时间）。
+- **已结束段**必须是节目单的连续前缀，其实际结束时刻单调不减；已结束段不参与压缩，
+  响应中保持计划时长。
+- **余量不足**：延误超过窗口内可压缩余量总和时，返回 `422` +
+  `INSUFFICIENT_MARGIN`，`details.unrecoverable_sec` 为无法追回的秒数。
+
+响应字段：
+
+- `segments`：按节目顺序排列，每项含 `id`、`planned_duration_sec`、
+  `adjusted_duration_sec`（分摊后时长）、`compressed_sec`（被压缩的秒数）、
+  `finished`（是否已结束）。
+- `fixed_points`：每个「前面有窗口」的固定点一项，含 `segment_id`、
+  `fixed_start_at_sec`、`absorbed_sec`（窗口内被压缩吸收的延误秒数）、
+  `remaining_sec`（固定点前剩余秒数，发生压缩时为 0）。
+
+### 请求示例（延误按比例分摊）
+
+`opening` 计划 600s 但实际 660s 才结束（晚 60s），`news` 必须在 1800s 准点开场：
+
+```bash
+curl -s http://localhost:8000/schedule/rebalance \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "segments": [
+      {"id": "opening",   "planned_duration_sec": 600, "min_duration_sec": 300, "actual_end_at_sec": 660},
+      {"id": "interview", "planned_duration_sec": 900, "min_duration_sec": 600},
+      {"id": "music",     "planned_duration_sec": 600, "min_duration_sec": 300},
+      {"id": "news",      "planned_duration_sec": 300, "min_duration_sec": 300, "fixed_start_at_sec": 1800}
+    ]
+  }'
+```
+
+可用时间 = 1800 − 660 = 1140s，计划还需 900 + 600 = 1500s，延误 360s；
+`interview` 与 `music` 余量均为 300s，各摊 180s。响应示例（`200`）：
+
+```json
+{
+  "segments": [
+    {"id": "opening",   "planned_duration_sec": 600, "adjusted_duration_sec": 600, "compressed_sec": 0,   "finished": true},
+    {"id": "interview", "planned_duration_sec": 900, "adjusted_duration_sec": 720, "compressed_sec": 180, "finished": false},
+    {"id": "music",     "planned_duration_sec": 600, "adjusted_duration_sec": 420, "compressed_sec": 180, "finished": false},
+    {"id": "news",      "planned_duration_sec": 300, "adjusted_duration_sec": 300, "compressed_sec": 0,   "finished": false}
+  ],
+  "fixed_points": [
+    {"segment_id": "news", "fixed_start_at_sec": 1800, "absorbed_sec": 360, "remaining_sec": 0}
+  ]
+}
+```
+
+### 请求示例（整数秒余数分配）
+
+延误 7s、三段余量各 3s：精确分摊值均为 `7 × 3 / 9 ≈ 2.33`，每段先分 2s，
+余 1s；小数部分相同，按节目顺序补给最靠前的 `a`（`a` 压 3s，`b`、`c` 各压 2s）：
+
+```bash
+curl -s http://localhost:8000/schedule/rebalance \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "segments": [
+      {"id": "a",    "planned_duration_sec": 103, "min_duration_sec": 100},
+      {"id": "b",    "planned_duration_sec": 103, "min_duration_sec": 100},
+      {"id": "c",    "planned_duration_sec": 103, "min_duration_sec": 100},
+      {"id": "news", "planned_duration_sec": 50,  "min_duration_sec": 50, "fixed_start_at_sec": 302}
+    ]
+  }'
+```
+
+```json
+{
+  "segments": [
+    {"id": "a",    "planned_duration_sec": 103, "adjusted_duration_sec": 100, "compressed_sec": 3, "finished": false},
+    {"id": "b",    "planned_duration_sec": 103, "adjusted_duration_sec": 101, "compressed_sec": 2, "finished": false},
+    {"id": "c",    "planned_duration_sec": 103, "adjusted_duration_sec": 101, "compressed_sec": 2, "finished": false},
+    {"id": "news", "planned_duration_sec": 50,  "adjusted_duration_sec": 50,  "compressed_sec": 0, "finished": false}
+  ],
+  "fixed_points": [
+    {"segment_id": "news", "fixed_start_at_sec": 302, "absorbed_sec": 7, "remaining_sec": 0}
+  ]
+}
+```
+
+### 请求示例（余量不足，422）
+
+`opening` 拖到 1700s 才结束，距离 1800s 的 `news` 只剩 100s，而 `interview`
+计划 500s、最多只能压缩 50s：
+
+```bash
+curl -s http://localhost:8000/schedule/rebalance \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "segments": [
+      {"id": "opening",   "planned_duration_sec": 600, "min_duration_sec": 600, "actual_end_at_sec": 1700},
+      {"id": "interview", "planned_duration_sec": 500, "min_duration_sec": 450},
+      {"id": "news",      "planned_duration_sec": 300, "min_duration_sec": 300, "fixed_start_at_sec": 1800}
+    ]
+  }'
+```
+
+响应（`422`）：延误 400s，余量只有 50s，仍有 350s 无法追回：
+
+```json
+{
+  "code": "INSUFFICIENT_MARGIN",
+  "message": "固定点 news（1800s）前可压缩余量不足，仍有 350 秒无法追回",
+  "details": {
+    "unrecoverable_sec": 350,
+    "required_compression_sec": 400,
+    "available_margin_sec": 50,
+    "fixed_point": {"segment_id": "news", "fixed_start_at_sec": 1800}
+  }
+}
+```
+
+## 接口约定：`POST /runs/reconcile`
+
+直播结束（或进行中复盘）时，把**计划口令**与**实播记录**对账：在每个通道内做
+保持顺序的一对一匹配，使「匹配对起止偏差绝对值之和 + 未匹配罚分」最小。
+
+请求体为一个对象：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `commands` | array | 是 | 计划口令数组，每一项的字段与 `POST /compile` 的请求体完全一致 |
+| `records` | array | 是 | 实播记录数组，见下表 |
+| `tolerance_ms` | integer | 是 | 匹配容差（毫秒），非负；起点偏差与终点偏差均不超过它才允许匹配 |
+| `miss_penalty` | integer | 是 | 漏播罚分，非负；每条未匹配的计划口令计一次 |
+| `extra_penalty` | integer | 是 | 额外播出罚分，非负；每条未匹配的实播记录计一次 |
+
+`records` 每一项字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `id` | string | 是 | 实播记录唯一 id；不能为空，各记录之间不可重复 |
+| `channel` | string | 是 | 通道标识；只有同通道的计划与实播才可匹配 |
+| `actual_start_ms` | integer | 是 | 实际起点（毫秒），不得为负 |
+| `actual_end_ms` | integer | 是 | 实际结束时刻（毫秒），必须大于 `actual_start_ms` |
+
+匹配规则：
+
+- 计划口令先按与 `/compile` 相同的锚点解析求出计划起止毫秒；随后每个通道内，
+  计划项与实播记录**分别按 `(起点, id)` 升序排列**。
+- 通道内做**保持顺序的一对一匹配**（类似序列比对：计划第 i 项与实播第 j 项匹配后，
+  后续匹配的下标只能更大），不同通道互不影响。
+- 仅当同一通道、且 `|起点偏差|` 与 `|终点偏差|` 都不超过 `tolerance_ms` 时
+  才允许匹配；该匹配对的代价为两个偏差绝对值之和。
+- **总罚分** = 各匹配对的起止偏差绝对值之和 + `miss_penalty` × 漏播计划数
+  + `extra_penalty` × 额外实播数，取总罚分最小的匹配。
+- **同分裁决**：总罚分相同时，依次取 ① 匹配对数更多者；
+  ② 匹配 id 对 `(plan_id, actual_id)` 序列（按通道内匹配顺序）字典序更小者。
+
+响应字段：
+
+- `matches`：匹配对列表，按 `(plan_id, actual_id)` 升序；每项含 `plan_id`、
+  `actual_id`、`channel`、`planned_interval`、`actual_interval`、
+  `start_deviation_ms`、`end_deviation_ms`。偏差为带符号值（**实际 − 计划**），
+  总罚分按偏差绝对值计算。
+- `missed_plan_ids`：未匹配的计划口令 id（漏播），按 id 升序。
+- `extra_actual_ids`：未匹配的实播记录 id（额外播出），按 id 升序。
+- `total_penalty`：总罚分。
+
+### 请求示例（正常对账）
+
+```bash
+curl -s http://localhost:8000/runs/reconcile \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commands": [
+      {"id": "a", "channel": "main", "anchor": "START", "offset_ms": 0, "duration_ms": 1000},
+      {"id": "b", "channel": "main", "anchor": "a",     "offset_ms": 0, "duration_ms": 500},
+      {"id": "c", "channel": "sub",  "anchor": "START", "offset_ms": 0, "duration_ms": 800}
+    ],
+    "records": [
+      {"id": "r1", "channel": "main", "actual_start_ms": 10,   "actual_end_ms": 1020},
+      {"id": "r2", "channel": "main", "actual_start_ms": 1010, "actual_end_ms": 1490},
+      {"id": "r3", "channel": "sub",  "actual_start_ms": 0,    "actual_end_ms": 900}
+    ],
+    "tolerance_ms": 50,
+    "miss_penalty": 200,
+    "extra_penalty": 300
+  }'
+```
+
+- 计划：`a` 为 `[0, 1000)`，`b` 为 `[1000, 1500)`，`c` 为 `[0, 800)`。
+- `main` 通道：`a ↔ r1` 偏差 10/20（代价 30）、`b ↔ r2` 偏差 10/−10（代价 20）。
+- `sub` 通道：`r3` 终点偏差 100 超过容差 50，不可匹配 → `c` 漏播（200）、
+  `r3` 额外播出（300）。
+- 总罚分 = 30 + 20 + 200 + 300 = **550**。响应示例（`200`）：
+
+```json
+{
+  "matches": [
+    {
+      "plan_id": "a",
+      "actual_id": "r1",
+      "channel": "main",
+      "planned_interval": [0, 1000],
+      "actual_interval": [10, 1020],
+      "start_deviation_ms": 10,
+      "end_deviation_ms": 20
+    },
+    {
+      "plan_id": "b",
+      "actual_id": "r2",
+      "channel": "main",
+      "planned_interval": [1000, 1500],
+      "actual_interval": [1010, 1490],
+      "start_deviation_ms": 10,
+      "end_deviation_ms": -10
+    }
+  ],
+  "missed_plan_ids": ["c"],
+  "extra_actual_ids": ["r3"],
+  "total_penalty": 550
+}
+```
+
+### 请求示例（非法实播区间，422）
+
+实播记录起点为负、或结束时刻不大于起点时返回 `422` + `INVALID_INTERVAL`：
+
+```bash
+curl -s http://localhost:8000/runs/reconcile \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commands": [],
+    "records": [
+      {"id": "r1", "channel": "main", "actual_start_ms": 900, "actual_end_ms": 500}
+    ],
+    "tolerance_ms": 50,
+    "miss_penalty": 200,
+    "extra_penalty": 300
+  }'
+```
+
+```json
+{
+  "code": "INVALID_INTERVAL",
+  "message": "实播区间非法：actual_start_ms 不得为负，且 actual_end_ms 必须大于 actual_start_ms",
+  "details": { "ids": ["r1"] }
+}
+```
+
+## 接口约定：`POST /routing/assign`
+
+在**不改变任何口令起止时刻**的前提下，把口令全局改派到按 id 指定的备用通道，
+消除同通道的时间重叠冲突。请求复用 `POST /compile` 的口令数组（先用同一套
+编排器解析锚点、校验时间），另附按口令 id 声明的备用通道列表。
+
+请求体为一个对象：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `commands` | array | 是 | 口令数组，每一项的字段与 `POST /compile` 的请求体完全一致 |
+| `backups` | array | 是 | 按口令 id 声明的备用通道列表，**至多 12 项** |
+
+`backups` 每一项字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `id` | string | 是 | 口令 id，必须存在于 `commands` 中且不能为空；同一 id 只能声明一次 |
+| `backup_channels` | array&lt;string&gt; | 是 | 备用通道名列表，至少 1 个；不能为空字符串、不能重复，也不应再列入原通道 |
+
+改派规则：
+
+- **只换通道、不动时间**：改派后每条口令的 `start_ms` / `end_ms`、`anchor`、
+  `offset_ms`、`duration_ms` 均保持 `/compile` 的解析结果不变，只有 `channel`
+  可能变化；`timeline` 的排序仍按 `(start_ms, id)`。
+- **未列出的口令只能留在原通道**；已列出的口令可落到**原通道或任一备用通道**
+  （原通道始终可选，无需也不应写进 `backup_channels`）。最多 **12** 条口令
+  可以拥有备用通道。
+- **半开区间重叠的口令不得分到同一通道**：`[start_ms, end_ms)` 与
+  `[start_ms', end_ms')` 重叠（`start < end'` 且 `start' < end`）即冲突；
+  **首尾相接（前一个 end 等于后一个 start）可以共用同一通道**；不同通道互不影响。
+- **全局最优**：在所有无冲突方案中，先取**改派口令数最少**（通道与原通道不同
+  的口令数）的方案；改派数并列时，取「口令按 **id 升序**排列后对应通道名序列」
+  **字典序最小**的方案。
+- 响应 `changed_ids` 为实际改派通道的口令 id（新通道与原通道不同），按 id 升序。
+- 不存在任何无冲突方案时返回 `422` + `NO_FEASIBLE_ROUTING`，`details.reason`
+  区分原因：`FIXED_OVERLAP`（不可改派口令自身重叠）、`NO_AVAILABLE_CHANNEL`
+  （某口令的原通道与全部备用通道都被占用）、`INSUFFICIENT_CHANNEL_CAPACITY`
+  （可移动口令之间无法安排）。
+
+### 请求示例（最少改派 + 字典序裁决）
+
+`a`、`b` 在 `main` 通道时间重叠，二者都有备用通道 `alt`：
+
+```bash
+curl -s http://localhost:8000/routing/assign \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commands": [
+      {"id": "a", "channel": "main", "anchor": "START", "offset_ms": 0,   "duration_ms": 100},
+      {"id": "b", "channel": "main", "anchor": "START", "offset_ms": 50,  "duration_ms": 100}
+    ],
+    "backups": [
+      {"id": "a", "backup_channels": ["alt"]},
+      {"id": "b", "backup_channels": ["alt"]}
+    ]
+  }'
+```
+
+最少只需改派 1 条。两个 1-move 方案按 id 排序的通道名序列分别为
+`[alt, main]`（a 改派）与 `[main, alt]`（b 改派），通道名直接按字典序比较，
+`[alt, main]` 更小，故改派 `a`。响应示例（`200`）：
+
+```json
+{
+  "timeline": [
+    {
+      "id": "a",
+      "channel": "alt",
+      "anchor": "START",
+      "offset_ms": 0,
+      "duration_ms": 100,
+      "start_ms": 0,
+      "end_ms": 100
+    },
+    {
+      "id": "b",
+      "channel": "main",
+      "anchor": "START",
+      "offset_ms": 50,
+      "duration_ms": 100,
+      "start_ms": 50,
+      "end_ms": 150
+    }
+  ],
+  "changed_ids": ["a"]
+}
+```
+
+### 请求示例（未列出的口令不能动）
+
+`f` 固定在 `main` 且与 `a` 时间重叠，`a` 的原通道与备用通道 `blocked` 都被
+占用，只有 `free` 空闲：
+
+```bash
+curl -s http://localhost:8000/routing/assign \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commands": [
+      {"id": "f", "channel": "main",    "anchor": "START", "offset_ms": 0,  "duration_ms": 100},
+      {"id": "g", "channel": "blocked", "anchor": "START", "offset_ms": 0,  "duration_ms": 100},
+      {"id": "a", "channel": "main",    "anchor": "START", "offset_ms": 50, "duration_ms": 100}
+    ],
+    "backups": [
+      {"id": "a", "backup_channels": ["blocked", "free"]}
+    ]
+  }'
+```
+
+```json
+{
+  "timeline": [
+    {"id": "f", "channel": "main",    "anchor": "START", "offset_ms": 0,  "duration_ms": 100, "start_ms": 0,   "end_ms": 100},
+    {"id": "a", "channel": "free",    "anchor": "START", "offset_ms": 50, "duration_ms": 100, "start_ms": 50,  "end_ms": 150},
+    {"id": "g", "channel": "blocked", "anchor": "START", "offset_ms": 0,  "duration_ms": 100, "start_ms": 0,   "end_ms": 100}
+  ],
+  "changed_ids": ["a"]
+}
+```
+
+### 请求示例（无可行方案，422）
+
+三条口令两两重叠，原通道均为 `main`，备用通道只有共享的 `alt`
+（2 个通道放不下 3 条两两重叠的口令）：
+
+```bash
+curl -s http://localhost:8000/routing/assign \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commands": [
+      {"id": "a", "channel": "main", "anchor": "START", "offset_ms": 0,  "duration_ms": 100},
+      {"id": "b", "channel": "main", "anchor": "START", "offset_ms": 10, "duration_ms": 100},
+      {"id": "c", "channel": "main", "anchor": "START", "offset_ms": 20, "duration_ms": 100}
+    ],
+    "backups": [
+      {"id": "a", "backup_channels": ["alt"]},
+      {"id": "b", "backup_channels": ["alt"]},
+      {"id": "c", "backup_channels": ["alt"]}
+    ]
+  }'
+```
+
+```json
+{
+  "code": "NO_FEASIBLE_ROUTING",
+  "message": "不存在满足时间重叠约束的无冲突改派方案",
+  "details": {
+    "reason": "INSUFFICIENT_CHANNEL_CAPACITY"
+  }
+}
+```
+
+## 接口约定：`POST /versions/merge`
+
+对 **base（基线）/ left / right** 三份口令版本做无状态三方合并：先把三份口令各自
+补全缺省字段（`anchor` 缺省 `START`、`offset_ms` 缺省 `0`），再按 **id 和字段**
+合并。单侧改动直接采纳；双侧改为相同值也采纳；双侧对同一字段改成不同值、以及
+一侧删除而另一侧修改时，返回按 `(id, field)` 排序的分歧，**不生成合并结果**。
+无分歧时再调用现有编排器校验合并口令（缺失锚点、依赖环、负起点等按原错误码
+返回 `422`），成功时返回按 id 排序的合并口令及与 `/compile` 同结构的时间线和冲突对。
+
+请求体为一个对象：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `base` | array | 是 | 基线口令数组，每一项的字段与 `POST /compile` 的请求体完全一致 |
+| `left` | array | 是 | 左侧版本口令数组，格式同 `base` |
+| `right` | array | 是 | 右侧版本口令数组，格式同 `base` |
+
+合并规则（以 id 标识同一条口令，逐字段比较）：
+
+- **单侧改动直接采纳**：只有一侧相对 base 修改某字段、另一侧未改，取修改侧的值；
+  单侧新增的口令直接进入合并结果；单侧删除（另一侧保留且未改动）直接采纳删除。
+- **双侧一致采纳**：两侧都未改动则保留 base 值；两侧都删除则该口令删除；
+  两侧把同一字段改成**相同值**时采纳该值。
+- **不同字段合并到同一口令**：两侧分别修改同一条口令的**不同字段**时，两处改动
+  合并进同一条口令。
+- **字段级分歧**（HTTP `200`，`status="diverged"`，不返回合并口令）：
+  - `MODIFY_MODIFY`：base 中存在的口令，两侧把同一字段改成**不同值**；
+  - `ADD_ADD`：两侧各自新增了相同 id 的口令，但某字段值不同；
+  - `DELETE_MODIFY`：一侧删除整条口令、另一侧修改了字段——每个被修改字段各记一条。
+- 分歧一律按 `(id, field)` 升序返回；每条分歧含 `base_value` / `left_value` /
+  `right_value`，删除侧或缺省 base（双侧新增）对应值为 `null`。
+- 某一版本内部出现重复 id 时返回 `422` + `DUPLICATE_ID`
+  （`details.side` 指明是哪一份：`base` / `left` / `right`）；其余字段级问题
+  （空 id、空通道、非正时长）由编排校验按原错误码返回。
+
+成功响应（`status="merged"`）字段：
+
+- `commands`：合并后的口令数组（已补全缺省字段），**按 id 升序**。
+- `timeline` / `conflicts`：对合并口令调用编排器的结果，结构与排序规则与
+  `POST /compile` 完全一致。
+
+### 请求示例（无分歧：不同字段自动合并）
+
+`left` 把 `a` 改到 `alt` 通道并新增 `b`；`right` 把 `a` 的时长延长到 1500
+并删除 `d`。两侧改的是 `a` 的不同字段，自动合并：
+
+```bash
+curl -s http://localhost:8000/versions/merge \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base": [
+      {"id": "a", "channel": "main", "anchor": "START", "offset_ms": 0, "duration_ms": 1000},
+      {"id": "d", "channel": "sub",  "anchor": "START", "offset_ms": 0, "duration_ms": 1000}
+    ],
+    "left": [
+      {"id": "a", "channel": "alt",  "anchor": "START", "offset_ms": 0, "duration_ms": 1000},
+      {"id": "b", "channel": "alt",  "anchor": "a",     "offset_ms": 0, "duration_ms": 500},
+      {"id": "d", "channel": "sub",  "anchor": "START", "offset_ms": 0, "duration_ms": 1000}
+    ],
+    "right": [
+      {"id": "a", "channel": "main", "anchor": "START", "offset_ms": 0, "duration_ms": 1500}
+    ]
+  }'
+```
+
+响应示例（`200`）：合并口令按 id 排序为 `a`、`b`；`timeline` 中 `b` 锚定合并后
+`a` 的结束时刻 1500：
+
+```json
+{
+  "status": "merged",
+  "commands": [
+    {"id": "a", "channel": "alt", "anchor": "START", "offset_ms": 0, "duration_ms": 1500},
+    {"id": "b", "channel": "alt", "anchor": "a",     "offset_ms": 0, "duration_ms": 500}
+  ],
+  "timeline": [
+    {"id": "a", "channel": "alt", "anchor": "START", "offset_ms": 0,    "duration_ms": 1500, "start_ms": 0,    "end_ms": 1500},
+    {"id": "b", "channel": "alt", "anchor": "a",     "offset_ms": 0,    "duration_ms": 500,  "start_ms": 1500, "end_ms": 2000}
+  ],
+  "conflicts": []
+}
+```
+
+### 请求示例（存在分歧，200）
+
+`x` 的通道两侧改成了不同值；`y` 被 left 删除、right 却改了时长；两侧还各自新增了
+同 id 的 `z` 但时长不同：
+
+```bash
+curl -s http://localhost:8000/versions/merge \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "base": [
+      {"id": "x", "channel": "main", "duration_ms": 1000},
+      {"id": "y", "channel": "main", "duration_ms": 1000}
+    ],
+    "left": [
+      {"id": "x", "channel": "alt",  "duration_ms": 1000},
+      {"id": "z", "channel": "main", "duration_ms": 100}
+    ],
+    "right": [
+      {"id": "x", "channel": "sub",  "duration_ms": 1000},
+      {"id": "y", "channel": "main", "duration_ms": 50},
+      {"id": "z", "channel": "main", "duration_ms": 200}
+    ]
+  }'
+```
+
+响应示例（`200`，不包含 `commands` / `timeline` / `conflicts`）：
+
+```json
+{
+  "status": "diverged",
+  "divergences": [
+    {"id": "x", "field": "channel",     "kind": "MODIFY_MODIFY", "base_value": "main", "left_value": "alt", "right_value": "sub"},
+    {"id": "y", "field": "duration_ms", "kind": "DELETE_MODIFY", "base_value": 1000,   "left_value": null,  "right_value": 50},
+    {"id": "z", "field": "duration_ms", "kind": "ADD_ADD",       "base_value": null,   "left_value": 100,   "right_value": 200}
+  ]
+}
+```
+
+合并口令本身编排非法时（例如单侧新增的口令锚定了一个谁都没有的 id），与
+`/compile` 一样返回 `422` + `MISSING_ANCHOR`；依赖环返回 `DEPENDENCY_CYCLE`、
+负起点返回 `NEGATIVE_START`，错误体结构与「错误处理」一节一致。
+
+## 接口约定：`POST /interruptions/plan`
+
+直播进行中需要在某条通道上临时插播一条固定时长的口令时，本接口在给定的整数
+毫秒起点窗口 `[earliest_start_ms, latest_start_ms]`（**闭区间，两端可取**）内
+挑选插播起点：现有口令先复用 `POST /compile` 的编排器校验并解析起止时刻，再对
+每个候选起点计算需要撤销的口令集合，选**撤销条数最少、并列时起点最早**的方案。
+
+请求体为一个对象：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `commands` | array | 是 | 现有口令数组，每一项的字段与 `POST /compile` 的请求体完全一致 |
+| `channel` | string | 是 | 插播目标通道；只有同通道口令参与重叠判定，不能为空 |
+| `duration_ms` | integer | 是 | 插播持续时长（毫秒），必须为正数 |
+| `earliest_start_ms` | integer | 是 | 允许的最早起点（毫秒，闭区间左端，含该点），不得为负 |
+| `latest_start_ms` | integer | 是 | 允许的最晚起点（毫秒，闭区间右端，含该点），不得小于 `earliest_start_ms` |
+| `cancellable_ids` | array&lt;string&gt; | 是 | 允许撤销的现有口令 id 列表（可为空数组）；id 必须存在于 `commands`，不可重复、不能为空串 |
+
+撤销与可行性规则：
+
+- 插播占用半开区间 `[start_ms, start_ms + duration_ms)`；同通道内与它**半开区间
+  重叠**的现有口令必须撤销，**首尾相接不算重叠**，不同通道互不影响。
+- 撤销还必须**递归包含所有锚点后继**：直接或间接以被撤口令为 `anchor` 的口令
+  一并撤销（跨通道同样递归）。等价地，一条口令被撤，当且仅当它的某条锚点链上
+  存在一条同通道、与插播重叠的口令。
+- 撤销集合中只要出现一个不在 `cancellable_ids` 内的口令，该起点即**不可行**。
+- 在窗口内所有可行起点中，先取撤销条数最少者；条数并列时取**起点最早**者。
+- 服务端**不逐毫秒枚举**：撤销集合只在现有口令的起止事件处变化，整体按事件点
+  扫描（O(n log n)），即便窗口宽达 2⁵³ 毫秒也即时返回。
+- 请求无状态、不落数据，服务端不会修改 `commands`。
+
+响应字段：
+
+- `start_ms`：选定的插播起点（毫秒）。
+- `cancelled_ids`：需要撤销的全部口令 id（含锚点后继递归），按 id 升序。
+- `timeline`：撤销后**剩余**口令的时间线，结构与排序与 `/compile` 完全一致
+  （按 `(start_ms, id)` 升序，不含插播口令本身）。
+
+### 请求示例（撤销含锚点后继传导）
+
+`a` 为 `main` 通道 `[0, 1000)`；`b` 锚定 `a`，为 `main` 通道 `[1000, 1500)`；
+`c` 在 `sub` 通道 `[0, 1000)`。插播 200 ms：
+
+- 起点 800：插播 `[800, 1000)` 与 `a` 重叠，撤销闭包为 `{a, b}`（b 是 a 的
+  锚点后继），共 2 条。
+- 起点 1000：插播 `[1000, 1200)` 与 `a` 首尾相接、只与 `b` 重叠，只撤 1 条，
+  为全局最优。
+
+```bash
+curl -s http://localhost:8000/interruptions/plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commands": [
+      {"id": "a", "channel": "main", "anchor": "START", "offset_ms": 0, "duration_ms": 1000},
+      {"id": "b", "channel": "main", "anchor": "a",     "offset_ms": 0, "duration_ms": 500},
+      {"id": "c", "channel": "sub",  "anchor": "START", "offset_ms": 0, "duration_ms": 1000}
+    ],
+    "channel": "main",
+    "duration_ms": 200,
+    "earliest_start_ms": 0,
+    "latest_start_ms": 1499,
+    "cancellable_ids": ["a", "b"]
+  }'
+```
+
+响应示例（`200`）：
+
+```json
+{
+  "start_ms": 1000,
+  "cancelled_ids": ["b"],
+  "timeline": [
+    {
+      "id": "a",
+      "channel": "main",
+      "anchor": "START",
+      "offset_ms": 0,
+      "duration_ms": 1000,
+      "start_ms": 0,
+      "end_ms": 1000
+    },
+    {
+      "id": "c",
+      "channel": "sub",
+      "anchor": "START",
+      "offset_ms": 0,
+      "duration_ms": 1000,
+      "start_ms": 0,
+      "end_ms": 1000
+    }
+  ]
+}
+```
+
+跨通道的锚点后继同样递归撤销：若还有一条 `x` 在 `sub` 通道锚定 `b`，起点 1000
+的 `cancelled_ids` 即为 `["b", "x"]`。
+
+### 请求示例（无撤销起点）
+
+窗口包含一个与所有同通道口令都不重叠的空档时，最早的空档起点胜出，
+`cancelled_ids` 为空数组。例如插播 200 ms、窗口起点放到 1500（与 `b` 的结束
+时刻首尾相接）：
+
+```json
+{
+  "start_ms": 1500,
+  "cancelled_ids": [],
+  "timeline": [
+    {"id": "a", "channel": "main", "anchor": "START", "offset_ms": 0, "duration_ms": 1000, "start_ms": 0,    "end_ms": 1000},
+    {"id": "c", "channel": "sub",  "anchor": "START", "offset_ms": 0, "duration_ms": 1000, "start_ms": 0,    "end_ms": 1000},
+    {"id": "b", "channel": "main", "anchor": "a",     "offset_ms": 0, "duration_ms": 500,  "start_ms": 1000, "end_ms": 1500}
+  ]
+}
+```
+
+### 请求示例（无可行起点，422）
+
+窗口内每个起点的撤销闭包都包含不可撤销口令时返回 `422` +
+`NO_FEASIBLE_INTERRUPTION`。下例中 `b` 不在 `cancellable_ids` 内：起点 800 时
+它经 `a` 的后继闭包被触及，起点 1000 时与插播直接重叠，窗口 `[0, 1499]` 内
+没有可行起点：
+
+```bash
+curl -s http://localhost:8000/interruptions/plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commands": [
+      {"id": "a", "channel": "main", "anchor": "START", "offset_ms": 0, "duration_ms": 1000},
+      {"id": "b", "channel": "main", "anchor": "a",     "offset_ms": 0, "duration_ms": 500}
+    ],
+    "channel": "main",
+    "duration_ms": 200,
+    "earliest_start_ms": 0,
+    "latest_start_ms": 1499,
+    "cancellable_ids": ["a"]
+  }'
+```
+
+```json
+{
+  "code": "NO_FEASIBLE_INTERRUPTION",
+  "message": "通道 main 在闭区间 [0, 1499] 内不存在可行插播起点：撤销闭包中包含不可撤销口令",
+  "details": {
+    "reason": "UNREVOCABLE_OVERLAP",
+    "channel": "main",
+    "duration_ms": 200,
+    "earliest_start_ms": 0,
+    "latest_start_ms": 1499,
+    "blocking_ids": ["b"]
+  }
+}
+```
+
+`details.blocking_ids` 给出窗口内任意起点的撤销闭包中可能出现的全部不可撤销
+口令 id（按 id 升序），便于调用方定位阻塞来源。若把窗口右端放宽到 1500，
+则起点 1500 与所有口令首尾相接，`cancelled_ids` 为空即可成功。
+
+## 错误处理
+
+所有业务错误均返回 HTTP `422`，响应体统一为：
+
+```json
+{
+  "code": "DEPENDENCY_CYCLE",
+  "message": "检测到依赖环: a -> b -> a",
+  "details": { "cycle": ["a", "b", "a"] }
+}
+```
+
+错误码：
+
+| `code` | 触发条件 |
+| --- | --- |
+| `INVALID_REQUEST` | 请求体不是合法的口令数组（字段缺失、类型错误、多余字段等） |
+| `DUPLICATE_ID` | 数组中出现重复 `id` |
+| `INVALID_ID` | `id` 为空，或使用了保留锚点名 `START` |
+| `INVALID_CHANNEL` | `channel` 为空 |
+| `INVALID_DURATION` | `duration_ms` 不是正数 |
+| `MISSING_ANCHOR` | `anchor` 指向一个不存在的口令 id |
+| `DEPENDENCY_CYCLE` | 锚点依赖构成环 |
+| `NEGATIVE_START` | 解析出的口令起点小于 `0`（起点不允许为负） |
+| `CHANGE_TARGET_NOT_FOUND` | 仅 `POST /preview`：`change.id` 在口令数组中不存在 |
+| `INVALID_FIXED_START` | 仅 `POST /schedule/rebalance`：固定开场时刻为负，或未按节目顺序严格递增 |
+| `INVALID_ACTUAL_END` | 仅 `POST /schedule/rebalance`：实际结束时刻为负、已结束段不构成连续前缀、结束时刻非单调不减，或已结束固定点段结束时刻早于其固定开场时刻 |
+| `INSUFFICIENT_MARGIN` | 仅 `POST /schedule/rebalance`：固定点前可压缩余量不足，`details.unrecoverable_sec` 为无法追回的秒数 |
+| `INVALID_INTERVAL` | 仅 `POST /runs/reconcile`：实播记录起点为负，或结束时刻不大于起点 |
+| `ROUTING_TARGET_NOT_FOUND` | 仅 `POST /routing/assign`：`backups[].id` 引用了不存在于 `commands` 的口令 id |
+| `DUPLICATE_BACKUP_CHANNEL` | 仅 `POST /routing/assign`：某条口令的备用通道列表存在重复通道名（含把原通道又列入） |
+| `TOO_MANY_BACKUP_TARGETS` | 仅直接调用核心逻辑时：携带备用通道的口令超过 12 条（HTTP 层由请求结构校验提前返回 `INVALID_REQUEST`） |
+| `NO_FEASIBLE_ROUTING` | 仅 `POST /routing/assign`：不存在满足时间重叠约束的无冲突方案，`details.reason` 为 `FIXED_OVERLAP` / `NO_AVAILABLE_CHANNEL` / `INSUFFICIENT_CHANNEL_CAPACITY` |
+| `INTERRUPTION_TARGET_NOT_FOUND` | 仅 `POST /interruptions/plan`：`cancellable_ids` 引用了不存在于 `commands` 的口令 id |
+| `NO_FEASIBLE_INTERRUPTION` | 仅 `POST /interruptions/plan`：起点窗口内每个可行起点的撤销闭包都含不可撤销口令，`details.reason=UNREVOCABLE_OVERLAP`，`details.blocking_ids` 为阻塞口令 |
+
+> `POST /versions/merge` 的字段级分歧不是错误：无论是否合并成功都返回 HTTP `200`，
+> 由响应体的 `status`（`merged` / `diverged`）区分；仅版本内部重复 id
+> （`DUPLICATE_ID`）或合并口令编排非法（`MISSING_ANCHOR` / `DEPENDENCY_CYCLE` /
+> `NEGATIVE_START` 等原错误码）时返回 `422`。
+
+`POST /schedule/rebalance` 额外约定：
+
+- `planned_duration_sec` 短于 `min_duration_sec`、或任一时长非正数时，返回
+  `INVALID_DURATION`；重复 `id`、空 `id` 分别返回 `DUPLICATE_ID`、`INVALID_ID`。
+- 已结束段的实际结束时刻越过下一个固定点、且窗口内已无可压缩的段时，同样返回
+  `INSUFFICIENT_MARGIN`（无法追回的时间已成事实）。
+
+`POST /preview` 额外约定：
+
+- `change` 缺少 `id`、`offset_ms` / `duration_ms` 一个都没给、字段类型错误或出现多余字段时，
+  返回 `INVALID_REQUEST`。
+- 原编排本身非法时，直接返回原编排对应的错误码；改动后编排非法（如把时长改成 0、起点改为负）时，
+  返回改动后编排对应的错误码（如 `INVALID_DURATION`、`NEGATIVE_START`）。
+
+`POST /runs/reconcile` 额外约定：
+
+- `commands` 的全部校验与错误码和 `/compile` 完全一致（含重复 id、缺失锚点、依赖环、
+  负起点等）；`records` 中重复 `id`、空 `id`、空 `channel` 分别返回
+  `DUPLICATE_ID`、`INVALID_ID`、`INVALID_CHANNEL`。
+- `tolerance_ms`、`miss_penalty`、`extra_penalty` 为负数、字段缺失或类型错误，
+  以及请求出现多余字段时，返回 `INVALID_REQUEST`。
+- `actual_start_ms` 为负、或 `actual_end_ms` 不大于 `actual_start_ms` 时，
+  返回 `INVALID_INTERVAL`。
+- 计划口令与实播记录同时非法时，先返回计划侧（`commands`）的错误码。
+
+`POST /routing/assign` 额外约定：
+
+- `commands` 的全部校验与错误码和 `/compile` 完全一致（含重复 id、缺失锚点、
+  依赖环、负起点等），且编排非法时优先返回编排错误码。
+- `backups` 中 id 为空返回 `INVALID_ID`；同一 id 重复声明返回 `DUPLICATE_ID`；
+  id 不存在于 `commands` 返回 `ROUTING_TARGET_NOT_FOUND`。
+- 备用通道名为空字符串返回 `INVALID_CHANNEL`；同一条声明内通道名重复、或把
+  原通道又列入备用列表，返回 `DUPLICATE_BACKUP_CHANNEL`。
+- `backups` 超过 12 项、`backup_channels` 为空列表、字段缺失/类型错误/多余字段，
+  返回 `INVALID_REQUEST`。
+- 无可行方案返回 `NO_FEASIBLE_ROUTING`：不可改派的口令在原通道自身时间重叠时
+  `reason=FIXED_OVERLAP`；某条口令的原通道与全部备用通道都被时间重叠口令占用时
+  `reason=NO_AVAILABLE_CHANNEL`（`details.ids` 给出对应口令）；其余情形为
+  `INSUFFICIENT_CHANNEL_CAPACITY`。
+- 服务端不会修改请求数据；改派不改变任何起止时刻，`timeline` 仅 `channel` 可能变化。
+
+`POST /versions/merge` 额外约定：
+
+- 三份口令均先按 `/compile` 的缺省规则补全 `anchor`、`offset_ms` 再比较，因此
+  省略缺省字段与显式给出缺省值视为相同内容。
+- 某份版本（`base` / `left` / `right`）内部出现重复 id 时返回 `DUPLICATE_ID`，
+  `details.side` 标明版本名；检测顺序为 `base` → `left` → `right`。
+- 无分歧时合并口令的全部编排校验与错误码和 `/compile` 完全一致（缺失锚点、依赖环、
+  负起点、空 id / 通道、非正时长等），编排非法时不返回合并口令。
+- 字段级分歧（`MODIFY_MODIFY` / `ADD_ADD` / `DELETE_MODIFY`）始终返回 HTTP `200`
+  且 `status="diverged"`，响应只有 `status` 与 `divergences` 两个字段。
+- 请求无状态、不落数据；服务端不会修改三份请求数组。
+
+`POST /interruptions/plan` 额外约定：
+
+- `commands` 的全部校验与错误码和 `/compile` 完全一致（含重复 id、缺失锚点、
+  依赖环、负起点等），且编排非法时优先返回编排错误码。
+- `duration_ms` 非正返回 `INVALID_DURATION`；`channel` 为空返回
+  `INVALID_CHANNEL`；`earliest_start_ms` / `latest_start_ms` 为负返回
+  `INVALID_REQUEST`；`latest_start_ms < earliest_start_ms` 同样返回
+  `INVALID_REQUEST`。
+- `cancellable_ids` 中出现空串返回 `INVALID_ID`；重复 id 返回 `DUPLICATE_ID`；
+  引用不存在的口令 id 返回 `INTERRUPTION_TARGET_NOT_FOUND`。
+- 字段缺失、类型错误、多余字段等结构问题返回 `INVALID_REQUEST`。
+- 起点窗口内不存在任何可行起点时返回 `NO_FEASIBLE_INTERRUPTION`，
+  `details.reason` 固定为 `UNREVOCABLE_OVERLAP`，`details.blocking_ids` 列出窗口内
+  任意起点撤销闭包中可能出现的全部不可撤销口令 id。
+- 起点选择只扫描现有口令起止事件对应的候选区间，不逐毫秒枚举；
+  `timeline` 为剩余口令的 `/compile` 原解析结果，不含插播口令本身。
+- 请求无状态、不落数据；服务端不会修改 `commands` 与 `cancellable_ids`。
+
+## 本地开发（不使用 Docker）
+
+要求 Python 3.11+：
+
+```bash
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8000
+```
+
+核心编排逻辑位于 `app/compiler.py`，节目单延误分摊逻辑位于 `app/rebalance.py`，
+实播对账逻辑位于 `app/reconcile.py`，通道改派逻辑位于 `app/routing.py`，
+口令三方合并逻辑位于 `app/merge.py`，临时插播规划逻辑位于
+`app/interruptions.py`，均仅使用标准库，可直接运行单元测试：
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+## 项目结构
+
+```
+.
+├── app/
+│   ├── __init__.py
+│   ├── compiler.py        # 纯标准库的依赖解析 / 时间计算 / 冲突检测
+│   ├── interruptions.py   # 纯标准库的临时插播规划（锚点森林欧拉序 + 线段树事件扫描）
+│   ├── merge.py           # 纯标准库的口令三方合并（按 id、字段合并 + 复用编排器校验）
+│   ├── rebalance.py       # 纯标准库的节目单延误分摊（固定点切窗 + 余量比例分摊）
+│   ├── reconcile.py       # 纯标准库的实播对账（通道内保序一对一匹配 + 最小罚分 DP）
+│   ├── routing.py         # 纯标准库的通道改派（位掩码分支限界：最少改派 + 字典序裁决）
+│   ├── schemas.py         # Pydantic 请求与响应模型
+│   └── main.py            # FastAPI 入口（/compile、/preview、/schedule/rebalance、/runs/reconcile、/routing/assign、/versions/merge、/interruptions/plan、/health、统一错误处理）
+├── tests/
+│   ├── test_compiler.py       # 编排核心逻辑单元测试（标准库 unittest）
+│   ├── test_interruptions.py  # 临时插播规划核心逻辑单元测试（含逐毫秒暴力对照 fuzz）
+│   ├── test_merge.py          # 三方合并核心逻辑单元测试（标准库 unittest）
+│   ├── test_rebalance.py      # 延误分摊核心逻辑单元测试（标准库 unittest）
+│   ├── test_reconcile.py      # 实播对账核心逻辑单元测试（标准库 unittest）
+│   └── test_routing.py        # 通道改派核心逻辑单元测试（标准库 unittest）
+├── requirements.txt
+├── Dockerfile
+└── docker-compose.yml
+```

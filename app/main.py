@@ -7,6 +7,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from .calibrate import calibrate_runs
 from .compiler import CompileError, compile_commands, preview_change
 from .interruptions import plan_interruption
 from .merge import merge_versions
@@ -14,6 +15,8 @@ from .rebalance import rebalance_schedule
 from .reconcile import reconcile_runs
 from .routing import assign_routing
 from .schemas import (
+    CalibrateRequest,
+    CalibrateResponse,
     CommandItem,
     CompileResponse,
     ErrorBody,
@@ -33,7 +36,7 @@ from .schemas import (
 
 app = FastAPI(
     title="直播导播口令编排 API",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "接收导播口令数组，解析锚点依赖得到每条口令的起止毫秒时间，"
         "并列出同通道半开区间重叠的冲突 id 对；"
@@ -41,6 +44,7 @@ app = FastAPI(
         "并按可压缩余量比例分摊节目单延误，保证固定开场时刻不被移动；"
         "直播结束后还可将计划口令与实播记录按通道保序对账，"
         "最小化起止偏差与漏播、额外播出罚分之和；"
+        "亦可逐通道估计整数时钟偏移，按双端容差划分一致与异常记录；"
         "亦可在不改变任何起止时刻的前提下，把口令全局改派到按 id 指定的"
         "备用通道，求改派口令最少的无冲突方案；"
         "还可对 base / left / right 三份口令版本按 id 和字段做无状态三方合并；"
@@ -129,6 +133,22 @@ async def reconcile(body: ReconcileRequest) -> dict:
         tolerance_ms=body.tolerance_ms,
         miss_penalty=body.miss_penalty,
         extra_penalty=body.extra_penalty,
+    )
+
+
+@app.post(
+    "/runs/calibrate",
+    response_model=CalibrateResponse,
+    tags=["runs"],
+    summary="时钟校准：逐通道估计整数时钟偏移并划分一致/异常记录",
+    responses={422: {"model": ErrorBody, "description": "请求非法或校准失败"}},
+)
+async def calibrate(body: CalibrateRequest) -> dict:
+    # 核心逻辑不依赖 Pydantic，直接喂入 dict 以便独立测试与复用
+    return calibrate_runs(
+        [item.model_dump() for item in body.commands],
+        [record.model_dump() for record in body.records],
+        tolerance_ms=body.tolerance_ms,
     )
 
 

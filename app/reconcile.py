@@ -62,7 +62,7 @@ def reconcile_runs(
     )["timeline"]
 
     # 2) 实播记录校验
-    _validate_records(records)
+    validate_records(records)
 
     # 3) 按通道分组；timeline 已按 (start_ms, id) 排序，过滤后通道内保持有序
     plans_by_channel: dict[str, list[PlanItem]] = {}
@@ -117,8 +117,12 @@ def reconcile_runs(
     }
 
 
-def _validate_records(records: list[dict[str, Any]]) -> None:
-    """实播记录的字段级校验，非法输入抛出 ``ReconcileError``。"""
+def validate_records(records: list[dict[str, Any]]) -> None:
+    """实播记录的字段级校验，非法输入抛出 ``ReconcileError``。
+
+    与 ``/runs/reconcile``、``/runs/calibrate`` 共用同一套校验：重复 id、
+    空 id、空通道、区间非法（起点为负或结束时刻不大于起点）。
+    """
     # 1) 重复 id
     seen: set[str] = set()
     duplicates: list[str] = []

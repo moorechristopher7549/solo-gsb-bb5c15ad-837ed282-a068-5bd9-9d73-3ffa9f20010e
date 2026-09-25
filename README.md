@@ -4,12 +4,13 @@
 解析每条口令在时间轴上的起止毫秒，并列出同一通道内半开区间重叠的冲突口令对；
 直播进行中还可对节目单做延误分摊，在不移动固定开场时刻的前提下把延误按各段
 可压缩余量比例分配给未播段；直播结束后可将计划口令与实播记录按通道保序对账，
-以最小的起止偏差与漏播、额外播出罚分还原实际播出情况；还可在不改变任何起止
-时刻的前提下，把口令全局改派到按 id 指定的备用通道，求改派口令最少、并列时
-通道名序列字典序最小的无冲突方案；亦可对 base / left / right 三份口令版本按
-id 和字段做无状态三方合并，无分歧时直接复用编排器校验合并结果；还可在给定起点
-窗口内为指定通道规划一条临时插播，求需要撤销的现有口令最少、并列时起点最早的
-插播方案。
+以最小的起止偏差与漏播、额外播出罚分还原实际播出情况；还可按实播记录逐通道
+估计一个整数时钟偏移，以双端容差划分一致与异常记录，定位采集时钟的整体漂移；
+还可在不改变任何起止时刻的前提下，把口令全局改派到按 id 指定的备用通道，
+求改派口令最少、并列时通道名序列字典序最小的无冲突方案；亦可对
+base / left / right 三份口令版本按 id 和字段做无状态三方合并，无分歧时直接
+复用编排器校验合并结果；还可在给定起点窗口内为指定通道规划一条临时插播，
+求需要撤销的现有口令最少、并列时起点最早的插播方案。
 
 - 在线接口文档（Swagger UI）：<http://localhost:8000/docs>
 - 健康检查：`GET /health`
@@ -17,6 +18,7 @@ id 和字段做无状态三方合并，无分歧时直接复用编排器校验�
 - 改动预览接口：`POST /preview`
 - 节目单延误分摊接口：`POST /schedule/rebalance`
 - 实播对账接口：`POST /runs/reconcile`
+- 时钟校准接口：`POST /runs/calibrate`
 - 通道改派接口：`POST /routing/assign`
 - 口令三方合并接口：`POST /versions/merge`
 - 临时插播规划接口：`POST /interruptions/plan`
@@ -546,6 +548,130 @@ curl -s http://localhost:8000/runs/reconcile \
 }
 ```
 
+## 接口约定：`POST /runs/calibrate`
+
+直播结束后，若怀疑某条通道的采集时钟相对计划时间轴存在整体漂移，可用本接口
+**逐通道估计一个整数时钟偏移**（毫秒）。实播记录与计划口令按 **id 一一对应**：
+记录 `id` 必须出现在计划口令中，且 `channel` 必须与该口令一致，否则返回 `422`。
+计划起止时刻复用 `POST /compile` 的编排器解析，实播记录的字段校验与
+`POST /runs/reconcile` 完全相同。
+
+请求体为一个对象：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `commands` | array | 是 | 计划口令数组，每一项的字段与 `POST /compile` 的请求体完全一致 |
+| `records` | array | 是 | 实播记录数组，字段与 `POST /runs/reconcile` 的 `records` 一致；`id` 必须出现在计划口令中且通道一致 |
+| `tolerance_ms` | integer | 是 | 双端容差（毫秒），非负 |
+
+校准规则：
+
+- 对通道内每条记录，把计划起点、终点分别加上候选偏移 `o` 后与实播起止比较：
+  仅当 `|actual_start_ms − (start_ms + o)|` 与 `|actual_end_ms − (end_ms + o)|`
+  **都不超过** `tolerance_ms`（双端容差，含等号）时，该记录对偏移 `o` 计为一致。
+  等价地，每条记录对应一个闭区间形式的候选整数偏移集合。
+- 每个通道独立选择 **一致记录数最多** 的整数偏移；并列时先取 **绝对值最小** 者，
+  再取 **数值较小** 者。按事件点扫描求解，不逐毫秒枚举。
+- 按选定偏移，通道内记录被划分为 `consistent_ids`（一致）与 `anomalous_ids`
+  （异常），均按 id 升序。
+- 某通道 **所有记录** 都无法被任何整数偏移满足双端容差时（通常意味着实播时长
+  与计划时长之差超过 `2 × tolerance_ms`），该通道标为 `uncalibratable`，
+  `offset_ms` 为 `null`，全部记录计入 `anomalous_ids`。
+- 只有实播记录出现过的通道才会返回；请求无状态、不落数据，服务端不会修改
+  `commands` 与 `records`。
+
+响应字段：
+
+- `channels`：各通道校准结果，按通道名升序；每项含：
+  - `channel`：通道标识。
+  - `status`：`calibrated`（已估计出偏移）或 `uncalibratable`（无法校准）。
+  - `offset_ms`：估计出的整数时钟偏移（毫秒）；无法校准时为 `null`。
+  - `consistent_ids` / `anomalous_ids`：按估计偏移划分的一致 / 异常记录 id，
+    均按 id 升序。
+
+### 请求示例（逐通道校准）
+
+`main` 通道三条口令整体漂移约 +30ms（`d` 例外），`sub` 通道的 `c` 实播时长
+比计划长 100ms，双端容差 10ms 下没有任何整数偏移能同时满足两端：
+
+```bash
+curl -s http://localhost:8000/runs/calibrate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commands": [
+      {"id": "a", "channel": "main", "anchor": "START", "offset_ms": 0, "duration_ms": 1000},
+      {"id": "b", "channel": "main", "anchor": "a",     "offset_ms": 0, "duration_ms": 500},
+      {"id": "d", "channel": "main", "anchor": "b",     "offset_ms": 0, "duration_ms": 500},
+      {"id": "c", "channel": "sub",  "anchor": "START", "offset_ms": 0, "duration_ms": 800}
+    ],
+    "records": [
+      {"id": "a", "channel": "main", "actual_start_ms": 30,   "actual_end_ms": 1030},
+      {"id": "b", "channel": "main", "actual_start_ms": 1040, "actual_end_ms": 1540},
+      {"id": "d", "channel": "main", "actual_start_ms": 1500, "actual_end_ms": 2000},
+      {"id": "c", "channel": "sub",  "actual_start_ms": 0,    "actual_end_ms": 900}
+    ],
+    "tolerance_ms": 10
+  }'
+```
+
+- `a` 的起点 / 终点偏差为 30 / 30，候选偏移 `[20, 40]`；`b` 偏差 40 / 40，
+  候选 `[30, 50]`；`d` 偏差 0 / 0，候选 `[-10, 10]`。
+- `main` 通道一致数最多的偏移落在 `[30, 40]`（`a`、`b` 一致），按绝对值最小
+  取 **30**；`d` 在该偏移下不满足双端容差，计为异常。
+- `sub` 通道 `c` 的起点偏差 0、终点偏差 100，没有任何整数偏移能让两端同时
+  落入 ±10ms，标为 `uncalibratable`。
+
+响应示例（`200`）：
+
+```json
+{
+  "channels": [
+    {
+      "channel": "main",
+      "status": "calibrated",
+      "offset_ms": 30,
+      "consistent_ids": ["a", "b"],
+      "anomalous_ids": ["d"]
+    },
+    {
+      "channel": "sub",
+      "status": "uncalibratable",
+      "offset_ms": null,
+      "consistent_ids": [],
+      "anomalous_ids": ["c"]
+    }
+  ]
+}
+```
+
+### 请求示例（记录 id 未出现在计划中，422）
+
+```bash
+curl -s http://localhost:8000/runs/calibrate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commands": [
+      {"id": "a", "channel": "main", "anchor": "START", "offset_ms": 0, "duration_ms": 1000}
+    ],
+    "records": [
+      {"id": "x", "channel": "main", "actual_start_ms": 0, "actual_end_ms": 1000}
+    ],
+    "tolerance_ms": 10
+  }'
+```
+
+```json
+{
+  "code": "CALIBRATION_TARGET_NOT_FOUND",
+  "message": "实播记录 id 未出现在计划口令中: x",
+  "details": { "ids": ["x"] }
+}
+```
+
+记录 `id` 在计划中但 `channel` 与该口令不一致时，返回 `422` +
+`CHANNEL_MISMATCH`，`details.mismatches` 给出每条不一致记录的计划通道与
+实播通道。
+
 ## 接口约定：`POST /routing/assign`
 
 在**不改变任何口令起止时刻**的前提下，把口令全局改派到按 id 指定的备用通道，
@@ -1008,7 +1134,9 @@ curl -s http://localhost:8000/interruptions/plan \
 | `INVALID_FIXED_START` | 仅 `POST /schedule/rebalance`：固定开场时刻为负，或未按节目顺序严格递增 |
 | `INVALID_ACTUAL_END` | 仅 `POST /schedule/rebalance`：实际结束时刻为负、已结束段不构成连续前缀、结束时刻非单调不减，或已结束固定点段结束时刻早于其固定开场时刻 |
 | `INSUFFICIENT_MARGIN` | 仅 `POST /schedule/rebalance`：固定点前可压缩余量不足，`details.unrecoverable_sec` 为无法追回的秒数 |
-| `INVALID_INTERVAL` | 仅 `POST /runs/reconcile`：实播记录起点为负，或结束时刻不大于起点 |
+| `INVALID_INTERVAL` | 仅 `POST /runs/reconcile`、`POST /runs/calibrate`：实播记录起点为负，或结束时刻不大于起点 |
+| `CALIBRATION_TARGET_NOT_FOUND` | 仅 `POST /runs/calibrate`：实播记录 `id` 未出现在计划口令中 |
+| `CHANNEL_MISMATCH` | 仅 `POST /runs/calibrate`：实播记录通道与对应计划口令的通道不一致 |
 | `ROUTING_TARGET_NOT_FOUND` | 仅 `POST /routing/assign`：`backups[].id` 引用了不存在于 `commands` 的口令 id |
 | `DUPLICATE_BACKUP_CHANNEL` | 仅 `POST /routing/assign`：某条口令的备用通道列表存在重复通道名（含把原通道又列入） |
 | `TOO_MANY_BACKUP_TARGETS` | 仅直接调用核心逻辑时：携带备用通道的口令超过 12 条（HTTP 层由请求结构校验提前返回 `INVALID_REQUEST`） |
@@ -1045,6 +1173,21 @@ curl -s http://localhost:8000/interruptions/plan \
 - `actual_start_ms` 为负、或 `actual_end_ms` 不大于 `actual_start_ms` 时，
   返回 `INVALID_INTERVAL`。
 - 计划口令与实播记录同时非法时，先返回计划侧（`commands`）的错误码。
+
+`POST /runs/calibrate` 额外约定：
+
+- `commands` 的全部校验与错误码和 `/compile` 完全一致；`records` 的字段级校验
+  （重复 `id`、空 `id`、空 `channel`、非法区间）与 `/runs/reconcile` 完全一致，
+  计划口令与实播记录同时非法时，先返回计划侧的错误码。
+- 记录 `id` 未出现在计划口令中时返回 `CALIBRATION_TARGET_NOT_FOUND`
+  （`details.ids` 为未出现的 id，按 id 升序）；记录通道与计划口令不一致时返回
+  `CHANNEL_MISMATCH`（`details.mismatches` 给出计划通道与实播通道）；
+  两类问题同时存在时先报 `CALIBRATION_TARGET_NOT_FOUND`。
+- `tolerance_ms` 为负数、字段缺失或类型错误，以及请求出现多余字段时，
+  返回 `INVALID_REQUEST`。
+- 响应只包含实播记录出现过的通道，按通道名升序；`consistent_ids` 与
+  `anomalous_ids` 均按 id 升序。
+- 请求无状态、不落数据；服务端不会修改 `commands` 与 `records`。
 
 `POST /routing/assign` 额外约定：
 
@@ -1102,7 +1245,8 @@ uvicorn app.main:app --reload --port 8000
 ```
 
 核心编排逻辑位于 `app/compiler.py`，节目单延误分摊逻辑位于 `app/rebalance.py`，
-实播对账逻辑位于 `app/reconcile.py`，通道改派逻辑位于 `app/routing.py`，
+实播对账逻辑位于 `app/reconcile.py`，时钟校准逻辑位于 `app/calibrate.py`，
+通道改派逻辑位于 `app/routing.py`，
 口令三方合并逻辑位于 `app/merge.py`，临时插播规划逻辑位于
 `app/interruptions.py`，均仅使用标准库，可直接运行单元测试：
 
@@ -1116,6 +1260,7 @@ python3 -m unittest discover -s tests
 .
 ├── app/
 │   ├── __init__.py
+│   ├── calibrate.py       # 纯标准库的时钟校准（候选偏移区间扫描 + 一致数最多裁决）
 │   ├── compiler.py        # 纯标准库的依赖解析 / 时间计算 / 冲突检测
 │   ├── interruptions.py   # 纯标准库的临时插播规划（锚点森林欧拉序 + 线段树事件扫描）
 │   ├── merge.py           # 纯标准库的口令三方合并（按 id、字段合并 + 复用编排器校验）
@@ -1123,8 +1268,9 @@ python3 -m unittest discover -s tests
 │   ├── reconcile.py       # 纯标准库的实播对账（通道内保序一对一匹配 + 最小罚分 DP）
 │   ├── routing.py         # 纯标准库的通道改派（位掩码分支限界：最少改派 + 字典序裁决）
 │   ├── schemas.py         # Pydantic 请求与响应模型
-│   └── main.py            # FastAPI 入口（/compile、/preview、/schedule/rebalance、/runs/reconcile、/routing/assign、/versions/merge、/interruptions/plan、/health、统一错误处理）
+│   └── main.py            # FastAPI 入口（/compile、/preview、/schedule/rebalance、/runs/reconcile、/runs/calibrate、/routing/assign、/versions/merge、/interruptions/plan、/health、统一错误处理）
 ├── tests/
+│   ├── test_calibrate.py      # 时钟校准核心逻辑单元测试（标准库 unittest）
 │   ├── test_compiler.py       # 编排核心逻辑单元测试（标准库 unittest）
 │   ├── test_interruptions.py  # 临时插播规划核心逻辑单元测试（含逐毫秒暴力对照 fuzz）
 │   ├── test_merge.py          # 三方合并核心逻辑单元测试（标准库 unittest）

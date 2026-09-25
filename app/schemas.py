@@ -288,6 +288,62 @@ class ReconcileResponse(BaseModel):
     total_penalty: int = Field(..., description="总罚分（匹配偏差绝对值之和 + 未匹配罚分）")
 
 
+class CalibrateRequest(BaseModel):
+    """POST /runs/calibrate 请求体：/compile 同格式计划口令数组 + 实播记录与双端容差。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    commands: list[CommandItem] = Field(
+        ..., description="计划口令数组，格式与 POST /compile 的请求体一致"
+    )
+    records: list[ActualRecord] = Field(
+        ...,
+        description=(
+            "实播记录数组；记录 id 必须出现在计划口令中，"
+            "且通道必须与该口令一致"
+        ),
+    )
+    tolerance_ms: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "双端容差（毫秒），非负；计划起点与终点加偏移后都落入实播起止的"
+            " ±tolerance_ms 范围内，该记录才计为一致"
+        ),
+    )
+
+
+class CalibrateChannelResult(BaseModel):
+    channel: str = Field(..., description="通道标识")
+    status: Literal["calibrated", "uncalibratable"] = Field(
+        ...,
+        description=(
+            "calibrated：已估计出整数时钟偏移；"
+            "uncalibratable：所有记录都无法满足双端容差，无法校准"
+        ),
+    )
+    offset_ms: int | None = Field(
+        ...,
+        description=(
+            "估计出的整数时钟偏移（毫秒）：一致记录数最多，"
+            "并列时绝对值最小、再数值较小；无法校准时为 null"
+        ),
+    )
+    consistent_ids: list[str] = Field(
+        ..., description="按估计偏移满足双端容差的实播记录 id，按 id 升序"
+    )
+    anomalous_ids: list[str] = Field(
+        ..., description="按估计偏移不满足双端容差的实播记录 id，按 id 升序"
+    )
+
+
+class CalibrateResponse(BaseModel):
+    channels: list[CalibrateChannelResult] = Field(
+        ...,
+        description="各通道的校准结果，按通道名升序；仅包含实播记录出现过的通道",
+    )
+
+
 class InterruptionPlanRequest(BaseModel):
     """POST /interruptions/plan 请求体：现有口令 + 插播目标通道 / 时长 / 起点窗口 / 可撤销口令。"""
 
@@ -426,6 +482,8 @@ class ErrorBody(BaseModel):
         "INVALID_ACTUAL_END",
         "INSUFFICIENT_MARGIN",
         "INVALID_INTERVAL",
+        "CALIBRATION_TARGET_NOT_FOUND",
+        "CHANNEL_MISMATCH",
         "ROUTING_TARGET_NOT_FOUND",
         "DUPLICATE_BACKUP_CHANNEL",
         "TOO_MANY_BACKUP_TARGETS",

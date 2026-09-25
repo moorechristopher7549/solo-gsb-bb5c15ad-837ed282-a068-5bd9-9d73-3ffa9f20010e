@@ -62,7 +62,7 @@ def reconcile_runs(
     )["timeline"]
 
     # 2) 实播记录校验
-    _validate_records(records)
+    validate_records(records)
 
     # 3) 按通道分组；timeline 已按 (start_ms, id) 排序，过滤后通道内保持有序
     plans_by_channel: dict[str, list[PlanItem]] = {}
@@ -117,8 +117,16 @@ def reconcile_runs(
     }
 
 
-def _validate_records(records: list[dict[str, Any]]) -> None:
-    """实播记录的字段级校验，非法输入抛出 ``ReconcileError``。"""
+def validate_records(
+    records: list[dict[str, Any]],
+    error_cls: type[CompileError] = ReconcileError,
+) -> None:
+    """实播记录的字段级校验，非法输入抛出 ``error_cls``。
+
+    供 ``reconcile_runs`` 与 ``app.calibrate`` 复用；``error_cls`` 默认为
+    ``ReconcileError``，调用方可传入自己的业务异常类型以区分错误来源，
+    抛出的 ``code`` / ``message`` / ``details`` 完全一致。
+    """
     # 1) 重复 id
     seen: set[str] = set()
     duplicates: list[str] = []
@@ -128,7 +136,7 @@ def _validate_records(records: list[dict[str, Any]]) -> None:
             duplicates.append(rid)
         seen.add(rid)
     if duplicates:
-        raise ReconcileError(
+        raise error_cls(
             "DUPLICATE_ID",
             f"存在重复的实播记录 id: {', '.join(sorted(duplicates))}",
             {"duplicates": sorted(duplicates)},
@@ -137,11 +145,11 @@ def _validate_records(records: list[dict[str, Any]]) -> None:
     # 2) 空 id / 空通道
     empty_ids = [record["id"] for record in records if record["id"] == ""]
     if empty_ids:
-        raise ReconcileError("INVALID_ID", "实播记录 id 不能为空", {"ids": empty_ids})
+        raise error_cls("INVALID_ID", "实播记录 id 不能为空", {"ids": empty_ids})
 
     empty_channels = [record["id"] for record in records if record["channel"] == ""]
     if empty_channels:
-        raise ReconcileError(
+        raise error_cls(
             "INVALID_CHANNEL", "通道名不能为空", {"ids": sorted(empty_channels)}
         )
 
@@ -153,7 +161,7 @@ def _validate_records(records: list[dict[str, Any]]) -> None:
         or record["actual_end_ms"] <= record["actual_start_ms"]
     ]
     if bad_interval:
-        raise ReconcileError(
+        raise error_cls(
             "INVALID_INTERVAL",
             "实播区间非法：actual_start_ms 不得为负，"
             "且 actual_end_ms 必须大于 actual_start_ms",
